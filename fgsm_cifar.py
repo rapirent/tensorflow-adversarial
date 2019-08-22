@@ -13,18 +13,32 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 import tensorflow as tf
+import tensorflow.contrib.slim as slim
 
 from attacks import fgm
 
+class_mapping = [
+    'airplane',
+    'automobile',
+    'bird',
+    'cat',
+    'deer',
+    'dog',
+    'frog',
+    'horse',
+    'ship',
+    'truck',
+]
 
-img_size = 28
-img_chan = 1
+
+img_size = 32
+img_chan = 3
 n_classes = 10
 
 
-print('\nLoading MNIST')
+print('\nLoading cifar10')
 
-mnist = tf.keras.datasets.mnist
+mnist = tf.keras.datasets.cifar10
 (X_train, y_train), (X_test, y_test) = mnist.load_data()
 X_train = np.reshape(X_train, [-1, img_size, img_size, img_chan])
 X_train = X_train.astype(np.float32) / 255
@@ -48,6 +62,47 @@ y_valid = y_train[n:]
 y_train = y_train[:n]
 
 print('\nConstruction graph')
+
+
+
+def cifarnet(images,logits=False,training=False,num_classes=10,
+             dropout_keep_prob=0.5,
+             prediction_fn=slim.softmax,
+             scope='CifarNet'):
+
+    end_points = {}
+    with tf.variable_scope(scope, 'CifarNet', [images]):
+        net = slim.conv2d(images, 64, [5,5], scope='conv1')
+        end_points['conv1'] = net
+        net = slim.max_pool2d(net, [2, 2], 2, scope='pool1')
+        end_points['pool1'] = net
+        net = tf.nn.lrn(net, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75, name='norm1')
+        net = slim.conv2d(net, 64, [5, 5], scope='conv2')
+        end_points['conv2'] = net
+        net = tf.nn.lrn(net, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75, name='norm2')
+        net = slim.max_pool2d(net, [2, 2], 2, scope='pool2')
+        end_points['pool2'] = net
+        net = slim.flatten(net)
+        end_points['Flatten'] = net
+        net = slim.fully_connected(net, 384, scope='fc3')
+        end_points['fc3'] = net
+        net = slim.dropout(net, dropout_keep_prob, is_training=training,
+                           scope='dropout3')
+        net = slim.fully_connected(net, 192, scope='fc4')
+        end_points['fc4'] = net
+        if not num_classes:
+            return net, end_points
+        logits_ = slim.fully_connected(net, num_classes,
+                                      biases_initializer=tf.zeros_initializer(),
+                                      weights_initializer=tf.truncated_normal_initializer(1 / 192.0),
+                                      weights_regularizer=None,
+                                      activation_fn=None,
+                                      scope='logits')
+        y = prediction_fn(logits_, scope='Predictions')
+
+    if logits:
+        return y, logits_
+    return y
 
 
 def model(x, logits=False, training=False):
@@ -83,15 +138,36 @@ class Dummy:
 
 env = Dummy()
 
+def inception_resnet_v2_arg_scope(weight_decay=0.00004,
+                                  batch_norm_decay=0.9997,
+                                  batch_norm_epsilon=0.001,
+                                  activation_fn=tf.nn.relu):
+  # Set weight_decay for weights in conv2d and fully_connected layers.
+  with slim.arg_scope([slim.conv2d, slim.fully_connected],
+                      weights_regularizer=slim.l2_regularizer(weight_decay),
+                      biases_regularizer=slim.l2_regularizer(weight_decay)):
+
+    batch_norm_params = {
+        'decay': batch_norm_decay,
+        'epsilon': batch_norm_epsilon,
+        'fused': None,  # Use fused batch norm if possible.
+    }
+    # Set activation_fn and parameters for batch_norm.
+    with slim.arg_scope([slim.conv2d], activation_fn=activation_fn,
+                        normalizer_fn=slim.batch_norm,
+                        normalizer_params=batch_norm_params) as scope:
+      return scope
+
+
 
 with tf.variable_scope('model'):
     env.x = tf.placeholder(tf.float32, (None, img_size, img_size, img_chan),
-                           name='x')
+                            name='x')
     env.y = tf.placeholder(tf.float32, (None, n_classes), name='y')
     env.training = tf.placeholder_with_default(False, (), name='mode')
-
-    env.ybar, logits = model(env.x, logits=True, training=env.training)
-
+    # env.x = tf.reshape(env.x, [-1, img_size, img_size, 1])
+    with slim.arg_scope(inception_resnet_v2_arg_scope()):
+        env.ybar, logits = cifarnet(env.x, logits=True, training=env.training)
     with tf.variable_scope('acc'):
         count = tf.equal(tf.argmax(env.y, axis=1), tf.argmax(env.ybar, axis=1))
         env.acc = tf.reduce_mean(tf.cast(count, tf.float32), name='acc')
@@ -102,7 +178,8 @@ with tf.variable_scope('model'):
         env.loss = tf.reduce_mean(xent, name='loss')
 
     with tf.variable_scope('train_op'):
-        optimizer = tf.train.AdamOptimizer()
+        # optimizer = tf.train.AdamOptimizer()
+        optimizer = tf.train.GradientDescentOptimizer(0.01)
         env.train_op = optimizer.minimize(env.loss)
 
     env.saver = tf.train.Saver()
@@ -110,7 +187,8 @@ with tf.variable_scope('model'):
 with tf.variable_scope('model', reuse=True):
     env.fgsm_eps = tf.placeholder(tf.float32, (), name='fgsm_eps')
     env.fgsm_epochs = tf.placeholder(tf.int32, (), name='fgsm_epochs')
-    env.x_fgsm = fgm(model, env.x, epochs=env.fgsm_epochs, eps=env.fgsm_eps)
+    with slim.arg_scope(inception_resnet_v2_arg_scope()):
+        env.x_fgsm = fgm(cifarnet, env.x, epochs=env.fgsm_epochs, eps=env.fgsm_eps)
 
 print('\nInitializing graph')
 
@@ -234,8 +312,8 @@ def make_fgsm(sess, env, X_data, epochs=1, eps=0.01, batch_size=128):
 
 print('\nTraining')
 
-train(sess, env, X_train, y_train, X_valid, y_valid, load=False, epochs=5,
-      name='mnist')
+train(sess, env, X_train, y_train, X_valid, y_valid, load=False, epochs=100,
+      name='cifar10')
 
 print('\nEvaluating on clean data')
 
@@ -258,7 +336,7 @@ z0 = np.argmax(y_test, axis=1)
 z1 = np.argmax(y1, axis=1)
 z2 = np.argmax(y2, axis=1)
 
-X_tmp = np.empty((10, 28, 28))
+X_tmp = np.empty((10, img_size, img_size, img_chan))
 X_clean_tmp = X_tmp.copy()
 y_tmp = np.empty((10, 10))
 y_clean_tmp = y_tmp.copy()
@@ -282,20 +360,20 @@ label_clean = np.argmax(y_clean_tmp, axis=1)
 proba_clean = np.max(y_clean_tmp, axis=1)
 for i in range(10):
     ax = fig.add_subplot(gs[0, i])
-    ax.imshow(X_tmp[i], cmap='gray', interpolation='none')
+    ax.imshow(X_tmp[i])
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.set_xlabel('{0} ({1:.2f})'.format(label[i], proba[i]),
+    ax.set_xlabel('{0} \n ({1:.2f})'.format(class_mapping[label[i]], proba[i]),
                   fontsize=12)
     ax_clean = fig.add_subplot(gs[1, i])
-    ax_clean.imshow(X_clean_tmp[i], cmap='gray', interpolation='none')
+    ax_clean.imshow(X_clean_tmp[i])
     ax_clean.set_xticks([])
     ax_clean.set_yticks([])
-    ax_clean.set_xlabel('{0} ({1:.2f})'.format(label_clean[i], proba_clean[i]),
+    ax_clean.set_xlabel('{0} \n ({1:.2f})'.format(class_mapping[label_clean[i]], proba_clean[i]),
                   fontsize=12)
 
 print('\nSaving figure')
 
 gs.tight_layout(fig)
 os.makedirs('img', exist_ok=True)
-plt.savefig('fgsm_mnist.png')
+plt.savefig('fgsm_cifar.png')
